@@ -1,0 +1,11 @@
+{
+  "undercurl": true,
+  "commentStyle": "italic",
+  "functionStyle": "",
+  "keywordStyle": "italic",
+  "statementStyle": "bold",
+  "typeStyle": "",
+  "transparent": false,
+  "dimInactive": false,
+  "terminalColors": true
+}

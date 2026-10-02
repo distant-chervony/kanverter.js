@@ -1,0 +1,233 @@
+#!/usr/bin/env node
+
+import { parseArgs } from "node:util";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+if ( process.argv.includes("-h") || process.argv.includes("--help") ) {
+  console.info(`usage: kanverter [-h|--help] [-t|--theme <str>] [-s|--save <path>] [-c|--config <path>]
+
+A Lua => Vimscript kanagawa colorsheme converter
+
+options:
+  -h, --help           Show this help message and exit
+  -t, --theme <str>    Choose a theme (default: "wave")
+  -s, --save <path>    Path to save the colorscheme (default: stdout)
+  -c, --config <path>  Set the path to the configuration file (default: "./config.json")
+  `);
+
+  process.exit(0);
+}
+
+let save;
+if (process.argv.includes("-s") || process.argv.includes("--save")) {
+  process.argv.map((ent, ind, arr) => {
+    if (
+      /^-s|--save$/.test(ent)
+      && arr[ind+1]
+      && !/^--?\w+/.test(arr[ind+1])
+    ) {
+      save = {
+        method: "path",
+        path: arr[ind+1],
+      }
+      arr.splice(ind, 2);
+    }
+    else if (
+      /^-s|--save$/.test(ent)
+      && (
+        /^--?\w+$/.test(arr[ind+1])
+        || typeof arr[ind+1] === "undefined"
+      )
+    ) {
+      save = {
+        method: "dir",
+        path: import.meta.dirname,
+      }
+      arr.splice(ind, 1);
+    }
+  })
+}
+
+const { values } = parseArgs({
+  options: {
+    theme: {
+      type: "string",
+      default: "wave",
+      short: "t",
+    },
+    config: {
+      type: "string",
+      default: join(import.meta.dirname, "config.json"),
+      short: "c",
+    },
+  }
+});
+if (!/^\s*(?:wave|dragon|lotus)\s*$/.test(values.theme)) {throw new Error("Invalid theme name");}
+
+const config = JSON.parse(
+  readFileSync(values.config, "utf-8")
+);
+Object.entries(config).forEach(([key, val]) => {
+  if (/Style/.test(key) && !val) {
+    config[key] = "NONE";
+  } else if (/Style/.test(key) && !/^(?:bold|italic)(?:,bold|,italic)?$|under(?:line|curl)/.test(val)) {
+    throw new Error(`Invalid configuration entry: "${key}: ${val}"`);
+  }
+});
+
+async function getPalette() {
+  const fetchPalette = await fetch("https://raw.githubusercontent.com/rebelot/kanagawa.nvim/refs/heads/master/lua/kanagawa/colors.lua");
+  if (!fetchPalette.ok) {throw new Error("Failed to fetch the palette");}
+  const rawPalette = await fetchPalette.text();
+
+  const begin = rawPalette.indexOf("local");
+  const end = rawPalette.indexOf("\n\nlocal", rawPalette.indexOf("}"));
+
+  return JSON.parse(
+    rawPalette
+      .slice(begin, end)
+      .replace(/local palette = /g, "")
+      .replace(/--.*/g, "")
+      .replace(/\s*?=/g, ":")
+      .replace(/(\w+)(?=:)/g, "\"$1\"")
+      .replace(/,(?=\s*(:?}|\]))/g, "")
+  );
+}
+
+async function getTheme(theme) {
+  const fetchTheme = await fetch("https://raw.githubusercontent.com/rebelot/kanagawa.nvim/refs/heads/master/lua/kanagawa/themes.lua");
+  if (!fetchTheme.ok) {throw new Error("Failed to fetch the theme");}
+  const themeText = await fetchTheme.text();
+
+  const begin = themeText.indexOf("return ", themeText.indexOf(`${theme} = function(palette)`));
+  const end = themeText.indexOf("    end,\n", begin);
+
+  return themeText
+      .slice(begin, end)
+      .replace(/ --.*/g, "")
+      .replace(/\s*?=/g, ": ")
+      .replace(/return /, "")
+      .replace(/(\w+)(?=:)/g, "\"$1\"")
+      .replace(/palette.\w+/g, "\"$&\"")
+      .replace(/(?<="term":\s+){/, "[")
+      .replace(/(?<="term":.*)}/s, "]")
+      .replace(/,(?=\s*(:?}|\]))/g, "")
+      .replace(/none/, "NONE");
+}
+
+async function getHighlights() {
+  const fetchEditor = fetch("https://raw.githubusercontent.com/rebelot/kanagawa.nvim/refs/heads/master/lua/kanagawa/highlights/editor.lua");
+  const fetchSyntax = fetch("https://raw.githubusercontent.com/rebelot/kanagawa.nvim/refs/heads/master/lua/kanagawa/highlights/syntax.lua");
+
+  const hlPromises = await Promise.all([
+    fetchEditor.then(res => {
+      if (!res.ok) {throw new Error("Failed to fetch the editor highlight bindings");}
+      return res.text()
+    }),
+    fetchSyntax.then(res => {
+      if (!res.ok) {throw new Error("Failed to fetch the syntax highlight bindings");}
+      return res.text()
+    }),
+  ]);
+
+  const [ editorText, syntaxText ] = hlPromises.map(grp => {
+    const begin = grp.indexOf("        --", grp.indexOf("    return {"));
+    const end = grp.indexOf("\nend");
+    return grp.slice(begin, end);
+    }
+  );
+
+  return `${editorText}\n${syntaxText}`;
+}
+
+;(async () => {
+  let [palette, theme, hl] = await Promise.all([
+    getPalette(),
+    getTheme(values.theme),
+    getHighlights()
+  ]);
+
+  theme = JSON.parse(
+    theme.replace(/palette.(\w+)/g, (_, p1) => {
+      return palette[p1];
+    })
+  );
+
+  hl = hl
+    .replace(/\s*--.*/g, "")                                                                                                                
+    .replace(/\s{2,}/g, "\n")
+    .replace(/\n(?=\w+)/g, "$&hi ")
+    .replace(/hi(?= \w+ = { link)/g, "$&! link")
+    .replace(/= { link = "(\w+)" }/g, "$1")
+
+    .replace(/=\svim.tbl_extend\("force",\s{\s(\w+\s=\s\w+(?:\.\w+)*)\s},\s(config.\w+)\),/g, "$1 gui=$2 cterm=$2")
+    .replace(/(?<=\s)(bg|fg|sp)(?=\s)/g, "gui$1")
+    .replace(/(?:= {\s|(?<!(?:fg|bg|sp)\s)= (?=v))|\s}|,|'|"/g,"")
+    .replace(/vim(?:\.\w+)*\s==\s.*or\W*/g, "")
+    .replace(/\s(=)\s/g,"$1")
+    .replace(/\n(?!\w+)/g, "")
+
+  if (config.dimInactive) {
+    hl = hl.replace(/config.dimInactive\sand\s(\w+(?:\.\w+)*) or NONE/g, "$1");
+  } else {
+    hl = hl.replace(/config.dimInactive\sand\s\w+(?:\.\w+)* or (NONE)/g, "$1");
+  }
+
+  if (config.transparent) {
+    hl = hl.replace(/not\sconfig.transparent\sand\s(\w+(?:\.\w+)*) or NONE/g, "$1");
+  } else {
+    hl = hl.replace(/not\sconfig.transparent\sand\s\w+(?:\.\w+)* or (NONE)/g, "$1");
+  }
+
+  if ( config.undercurl ) {
+    hl = hl.replace(/(undercurl)=config.undercurl/g, "gui=$1 cterm=$1")
+      .replace(/ underline=not config.undercurl/g, "");
+  } else {
+    hl = hl.replace(/(underline)=not config.undercurl/g, "gui=$1 cterm=$1")
+      .replace(/ undercurl=config.undercurl/g, "");
+  }
+
+  if ( config.terminalColors ) {
+    hl = hl.replace(/^/, `vimscript9\n\nhi clear\n\ng:colors_name = 'kanagawa_${values.theme}'\ng:termguicolors = [${theme.term.map(x => `'${x}'`)}]\n`);
+  } else {
+    hl = hl.replace(/^/, `vimscript9\n\nhi clear\n\ng:colors_name = 'kanagawa_${values.theme}'\n`);
+  }
+
+  hl = hl
+    .replace(/(?<!.*guibg.*)guifg=\w+(?:\.\w+)*(?!.*guibg.*)/g, "$& cterm=NONE term=NONE ctermfg=NONE ctermbg=NONE gui=NONE guibg=NONE")
+    .replace(/(?<!.*guifg.*)guibg=\w+(?:\.\w+)*(?!.*guifg.*)/g, "$& cterm=NONE term=NONE ctermfg=NONE ctermbg=NONE gui=NONE guifg=NONE")
+    .replace(/gui(?:f|b)g="?\w+(?:\.\w+)*"?\sgui(?:f|b)g="?\w+(?:\.\w+)*"?/g, "$& cterm=NONE term=NONE ctermfg=NONE ctermbg=NONE gui=NONE")
+    .replace(/(?<=guisp=\w+(?:\.\w+)*)\n/g, " ctermfg=NONE ctermbg=NONE term=NONE guibg=NONE guifg=NONE$&")
+                                                                                                                                             
+    .replace(/(?:hi|hi\! link) (?:Diagnostic.*|Lsp.*|.*Float.*|NormalNC).*\n/g, "")
+                                                                                                                                             
+    .replace(/(?:\sgui|\scterm)=NONE(?=.*gui=config\.\w+Style\scterm=config\.\w+Style)/g, "")
+                                                                                                                                             
+    .replace(/(bold|italic|underline)=true/g, "gui=$1 cterm=$1")
+    .replace(/(?<=hi (?:Bold|Italic))/g, " term=NONE ctermfg=NONE ctermbg=NONE gui=NONE guibg=NONE guifg=NONE")
+    .replace(/\s(?:cterm|gui)=NONE(?=.*gui=(bold|italic|underline)\scterm=\1)/g, "")
+    .replace(/theme\.(\w+(\.\w+)*)/g, (_, p1) => {
+      return p1.split(".").reduce((curr, next) => curr[next], theme)
+    })
+    .replace(/config\.(\w+(\.\w+)*)/g, (_, p1) => {
+      return p1.split(".").reduce((curr, next) => curr[next], config)
+    });
+  return hl;
+})().then(result => {
+  switch (save?.method) {
+    case "path":
+      writeFileSync(join(save.path, `kanagawa_${values.theme}.vim`), result);
+      console.log("File saved successfully");
+      break;
+
+    case "dir":
+      writeFileSync(join(save.path, `kanagawa_${values.theme}.vim`), result);
+      console.log("File saved successfully");
+      break;
+
+    case undefined:
+      console.log(result);
+      break;
+  }
+});
